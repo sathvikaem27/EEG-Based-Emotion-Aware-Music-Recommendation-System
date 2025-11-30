@@ -1,0 +1,79 @@
+# === PREPROCESS & EMOTION MAPPING ===
+import pandas as pd
+import numpy as np
+from scipy.stats import zscore
+
+# load your spotify-like CSV
+path = "/mnt/data/data.csv"
+df = pd.read_csv(path)
+
+# ensure 'id' exists (copy from common id columns if present)
+id_candidates = ['id','track_id','song_id','spotify_id','uri']
+existing = None
+for c in id_candidates:
+    if c in df.columns:
+        existing = c
+        break
+
+if existing is None:
+    # fallback: make id from name + artists + index (stable)
+    if 'name' in df.columns and 'artists' in df.columns:
+        df['id'] = df['name'].astype(str) + " -- " + df['artists'].astype(str) + " -- " + df.index.astype(str)
+    elif 'name' in df.columns:
+        df['id'] = df['name'].astype(str) + " -- " + df.index.astype(str)
+    else:
+        df['id'] = df.index.astype(str)
+else:
+    df['id'] = df[existing].astype(str)
+
+# ensure required features exist or fill missing as zeros (you can change this)
+for c in ['valence','energy','acousticness','danceability']:
+    if c not in df.columns:
+        df[c] = 0.0
+    else:
+        df[c] = df[c].fillna(df[c].median())
+
+# compute scores
+valence_raw = df['valence']
+arousal_raw = df['energy']              # YOUR CHOICE: arousal := energy
+dominance_raw = (df['energy'] + df['danceability'] - df['acousticness']) / 3.0
+
+# z-score safely (if constant -> zeros)
+def safe_z(s):
+    if s.std() == 0 or np.isnan(s.std()):
+        return np.zeros(len(s))
+    return zscore(s)
+
+df['_valence_score'] = safe_z(valence_raw)
+df['_arousal_score'] = safe_z(arousal_raw)
+df['_dominance_score'] = safe_z(dominance_raw)
+
+# median thresholds -> high/low bins
+v_med = np.median(df['_valence_score'])
+a_med = np.median(df['_arousal_score'])
+d_med = np.median(df['_dominance_score'])
+
+df['valence_bin'] = (df['_valence_score'] > v_med).astype(int)
+df['arousal_bin'] = (df['_arousal_score'] > a_med).astype(int)
+df['dominance_bin'] = (df['_dominance_score'] > d_med).astype(int)
+
+# vectorized mapping: code = valence*4 + arousal*2 + dominance*1
+code_to_label = {
+    7: "Excitement/Elation",      # 111
+    3: "Anger/Hostility",         # 011
+    6: "Pleasure/Amusement",      # 110
+    2: "Fear/Anxiety",            # 010
+    5: "Peacefulness/Serenity",   # 101
+    1: "Sadness/Depression",      # 001
+    4: "Relaxation/Calm Confidence", #100
+    0: "Boredom/Irritation"       # 000
+}
+
+codes = df['valence_bin']*4 + df['arousal_bin']*2 + df['dominance_bin']
+df['emotion_label'] = codes.map(code_to_label)
+
+# Save results (includes 'id' column)
+out_path = "/mnt/data/songs_with_emotion.csv"
+df.to_csv(out_path, index=False)
+print("Saved:", out_path)
+
