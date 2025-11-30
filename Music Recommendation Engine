@@ -1,0 +1,92 @@
+# ===== Top-5 closest songs INSIDE a mapped class  =====
+import pandas as pd, numpy as np
+from pathlib import Path
+
+# --- CONFIG: file you uploaded (session file path) ---
+DATA_FILE = "/content/sample_data/songs_with_emotion_final.xlsx"   # your uploaded file
+OUT_DIR = "/content"
+TOP_K = 5
+
+# --- load robustly ---
+def smart_load(path):
+    try:
+        return pd.read_excel(path, engine="openpyxl")
+    except Exception:
+        try:
+            return pd.read_csv(path)
+        except Exception as e:
+            raise RuntimeError("Cannot load file: " + str(e))
+
+df = smart_load(DATA_FILE)
+print("Loaded rows:", len(df))
+
+# --- ensure necessary columns exist (bins + continuous scores) ---
+needed = ['valence_bin','arousal_bin','dominance_bin','_valence_score','_arousal_score','_dominance_score','id','emotion_label']
+miss = [c for c in needed if c not in df.columns]
+if miss:
+    raise ValueError("Missing required columns: " + ", ".join(miss))
+
+# --- normalize continuous V/A/D to 0..1 (min-max) ---
+def norm01(col):
+    col = col.astype(float)
+    mi, ma = np.nanmin(col), np.nanmax(col)
+    if ma - mi < 1e-9:
+        return np.zeros(len(col))
+    return (col - mi) / (ma - mi)
+
+df['_v_norm'] = norm01(df['_valence_score'])
+df['_a_norm'] = norm01(df['_arousal_score'])
+df['_d_norm'] = norm01(df['_dominance_score'])
+
+# --- safe integer casting for bins and vad_code ---
+df['valence_bin']   = pd.to_numeric(df['valence_bin'], errors='coerce').fillna(0).astype(int)
+df['arousal_bin']   = pd.to_numeric(df['arousal_bin'], errors='coerce').fillna(0).astype(int)
+df['dominance_bin'] = pd.to_numeric(df['dominance_bin'], errors='coerce').fillna(0).astype(int)
+df['vad_code'] = df['valence_bin']*4 + df['arousal_bin']*2 + df['dominance_bin']
+
+# --- mapping rule (your specified mapping) ---
+map_dict = {
+    "111": "111",
+    "100": "100",
+    "101": "101",
+    "110": "110",
+    "011": "101",
+    "010": "100",
+    "001": "101",
+    "000": "110"
+}
+
+def map_input_to_target(v,a,d):
+    key = f"{int(v)}{int(a)}{int(d)}"
+    out = map_dict[key]
+    return int(out[0]), int(out[1]), int(out[2])
+
+def topk_closest_within_class(v_in, a_in, d_in, topk=TOP_K):
+    vt, at, dt = map_input_to_target(v_in, a_in, d_in)
+    target_code = vt*4 + at*2 + dt
+    print(f"Input {v_in}{a_in}{d_in} -> mapped target {vt}{at}{dt} (vad_code={target_code})")
+    subset = df[df['vad_code'] == target_code].copy()
+    if subset.empty:
+        print("No songs in that mapped class.")
+        return subset
+    # compute Euclidean distance inside this subset only
+    subset['distance'] = np.sqrt(
+        (subset['_v_norm'] - float(vt))**2 +
+        (subset['_a_norm'] - float(at))**2 +
+        (subset['_d_norm'] - float(dt))**2
+    )
+    subset = subset.sort_values('distance', ascending=True)
+    cols = [c for c in ['id','name','artists','emotion_label','_v_norm','_a_norm','_d_norm','distance','popularity'] if c in subset.columns]
+    topk_df = subset[cols].head(topk).reset_index(drop=True)
+    # save CSV
+    outpath = Path(OUT_DIR) / f"top{topk}_V{vt}A{at}D{dt}.csv"
+    topk_df.to_csv(outpath, index=False)
+    print(f"Saved top-{topk} to: {outpath}")
+    return topk_df
+
+# === Example: get top-5 for input 110 (maps to 110) ===
+playlist_110_top5 = topk_closest_within_class(0,1,0, topk=5)
+print("\nTop-5 (closest distances) inside mapped class (display):")
+display(playlist_110_top5)
+
+
