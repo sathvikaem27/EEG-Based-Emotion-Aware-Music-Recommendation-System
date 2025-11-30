@@ -1,0 +1,447 @@
+# ============================================================
+#    CNN + TRANSFORMER + HANDCRAFTED FEATURES (Emotion recognition )
+#   (Valence / Arousal / Dominance on DEAP-style data)
+# ============================================================
+
+!pip install -q numpy scipy scikit-learn joblib pandas
+
+import os, glob, pickle, random
+import numpy as np
+import pandas as pd
+
+from scipy.signal import welch
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks, optimizers
+
+# ------------------- CONFIG -------------------
+DATA_DIR     = "/content"                         # folder with s01.dat ... s32.dat
+RATINGS_PATH = "/content/participant_ratings.xls"
+
+DOWNSAMPLE = 8          # 128 -> 16 Hz
+WIN        = 256        # 2-second windows @ 16 Hz
+STEP       = 128        # 50% overlap
+SKIP_SEC   = 2          # skip first & last 2 seconds
+BATCH      = 64
+EPOCHS     = 20
+AUG_STD    = 0.02
+SEED       = 42
+
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+random.seed(SEED)
+
+# ============================================================
+#   FEATURE FUNCTIONS
+# ============================================================
+def bandpower(epoch, fs):
+    # epoch: (channels, samples)
+    freqs, psd = welch(epoch, fs=fs, nperseg=min(fs*2, epoch.shape[1]), axis=1)
+    bands = [(1,4),(4,8),(8,13),(13,30),(30,45)]
+    out = []
+    for lo, hi in bands:
+        idx = (freqs >= lo) & (freqs <= hi)
+        out.append(np.trapezoid(psd[:, idx], freqs[idx], axis=1))
+    return np.stack(out, axis=1)   # (C, 5)
+
+def hjorth_params(sig):
+    # sig: (C, N)
+    d1 = np.diff(sig, axis=1)
+    d2 = np.diff(d1, axis=1)
+    v0 = np.var(sig, axis=1)
+    v1 = np.var(d1, axis=1)
+    v2 = np.var(d2, axis=1)
+    mob  = np.sqrt(v1 / (v0 + 1e-12))
+    comp = np.sqrt(v2 / (v1 + 1e-12)) / (mob + 1e-12)
+    return np.stack([v0, mob, comp], axis=1)  # (C, 3)
+
+def diff_entropy(sig):
+    v = np.var(sig, axis=1)
+    return 0.5 * np.log(2 * np.pi * np.e * (v + 1e-12))  # (C,)
+
+def extract_feats(epoch, fs):
+    # epoch: (C, N) -> (C*11,)
+    bp   = bandpower(epoch, fs)              # (C,5)
+    hj   = hjorth_params(epoch)             # (C,3)
+    de   = diff_entropy(epoch)[:, None]     # (C,1)
+    stats = np.stack([epoch.mean(axis=1),
+                      epoch.std(axis=1)], axis=1)  # (C,2)
+    all_feats = np.concatenate([bp, hj, de, stats], axis=1)  # (C,11)
+    return all_feats.flatten()
+
+# ============================================================
+#   LOAD EEG (SKIP PARTICIPANT 1)
+# ============================================================
+def load_eeg_with_keys(path):
+    X_list = []
+    keys   = []
+    for f in sorted(glob.glob(os.path.join(path, "s*.dat"))):
+        base = os.path.basename(f)
+        pid = int(base[1:3])
+        if pid == 1:
+            print("Skipping P1 EEG:", f)
+            continue
+
+        with open(f, "rb") as h:
+            dat = pickle.load(h, encoding="latin1")
+
+        X = dat["data"][:, :, ::DOWNSAMPLE]   # (trials, C, T')
+        # per-subject normalization (across all trials/time)
+        mean = X.mean(axis=(0, 2), keepdims=True)
+        std  = X.std(axis=(0, 2), keepdims=True) + 1e-9
+        X = (X - mean) / std
+
+        for t in range(X.shape[0]):
+            X_list.append(X[t])
+            keys.append((pid, t+1))  # t+1 -> trial index in ratings
+
+    return np.stack(X_list, axis=0), keys
+
+print("Loading EEG...")
+X_all, keys = load_eeg_with_keys(DATA_DIR)
+fs_new = 128 // DOWNSAMPLE
+print("EEG shape:", X_all.shape, "fs_new:", fs_new)
+
+# ============================================================
+#   LOAD RATINGS & CLEAN LABELS (DROP 5)
+# ============================================================
+df = pd.read_excel(RATINGS_PATH)
+df.columns = [c.strip().lower() for c in df.columns]
+df.rename(columns={'participant_id': 'pid'}, inplace=True)
+
+label_dict = {}
+for _, row in df.iterrows():
+    pid = int(row['pid'])
+    if pid == 1:
+        continue
+    trial = int(row['trial'])
+    v = int(row['valence'])
+    a = int(row['arousal'])
+    d = int(row['dominance'])
+    # drop ambiguous cases
+    if v == 5 or a == 5 or d == 5:
+        continue
+    label_dict[(pid, trial)] = (v, a, d)
+
+print("Total labeled (clean) entries:", len(label_dict))
+
+# ============================================================
+#   ALIGN EEG TRIALS & LABELS
+# ============================================================
+X_trials = []
+Yv_trials, Ya_trials, Yd_trials = [], [], []
+trial_map = []
+
+for i, (pid, tr) in enumerate(keys):
+    key = (pid, tr)
+    if key not in label_dict:
+        continue
+    v, a, d = label_dict[key]
+    X_trials.append(X_all[i])
+    Yv_trials.append(1 if v >= 6 else 0)
+    Ya_trials.append(1 if a >= 6 else 0)
+    Yd_trials.append(1 if d >= 6 else 0)
+    trial_map.append((pid, tr))
+
+X_trials   = np.array(X_trials, dtype=np.float32)
+Yv_trials  = np.array(Yv_trials, dtype=np.int32)
+Ya_trials  = np.array(Ya_trials, dtype=np.int32)
+Yd_trials  = np.array(Yd_trials, dtype=np.int32)
+
+print("Trials kept:", X_trials.shape[0])
+print("Valence counts:", np.bincount(Yv_trials))
+print("Arousal counts:", np.bincount(Ya_trials))
+print("Dominance counts:", np.bincount(Yd_trials))
+
+# ============================================================
+#   WINDOWING (2s, 50% overlap, SKIP first/last 2s)
+# ============================================================
+skip = SKIP_SEC * fs_new
+
+Xw, Fw = [], []
+Vw, Aw, Dw = [], [], []
+trial_idx = []
+
+N_trials, C, T = X_trials.shape
+print("Windowing...")
+
+for i in range(N_trials):
+    tr = X_trials[i]
+    v, a, d = Yv_trials[i], Ya_trials[i], Yd_trials[i]
+
+    start = skip
+    end   = T - skip - WIN
+    if end <= start:
+        continue
+
+    for s in range(start, end + 1, STEP):
+        w = tr[:, s:s+WIN]  # (C, WIN)
+        if w.shape[1] < WIN:
+            continue
+        Xw.append(w)
+        Fw.append(extract_feats(w, fs_new))
+        Vw.append(v)
+        Aw.append(a)
+        Dw.append(d)
+        trial_idx.append(i)
+
+Xw = np.array(Xw, dtype=np.float32)  # (Nw, C, WIN)
+Fw = np.array(Fw, dtype=np.float32)  # (Nw, feat_dim)
+Vw = np.array(Vw, dtype=np.int32)
+Aw = np.array(Aw, dtype=np.int32)
+Dw = np.array(Dw, dtype=np.int32)
+trial_idx = np.array(trial_idx, dtype=np.int32)
+
+print("Windows:", Xw.shape)
+
+# ============================================================
+#   JOINT OVERSAMPLING (8 COMBINATIONS OF V/A/D)
+# ============================================================
+joint = (Vw.astype(int) << 2) + (Aw.astype(int) << 1) + Dw.astype(int)
+classes, counts = np.unique(joint, return_counts=True)
+print("Joint BEFORE:", dict(zip(classes, counts)))
+maxc = counts.max()
+
+Xb_list, Fb_list = [Xw], [Fw]
+Vb_list, Ab_list, Db_list = [Vw], [Aw], [Dw]
+Tb_list = [trial_idx]
+
+for cls, cnt in zip(classes, counts):
+    idx  = np.where(joint == cls)[0]
+    need = maxc - cnt
+    if need <= 0:
+        continue
+
+    ch = np.random.choice(idx, size=need, replace=True)
+    aug_x, aug_f, aug_v, aug_a, aug_d, aug_t = [], [], [], [], [], []
+    for i in ch:
+        w = Xw[i] + np.random.randn(*Xw[i].shape) * AUG_STD
+        aug_x.append(w)
+        aug_f.append(extract_feats(w, fs_new))
+        aug_v.append(Vw[i]); aug_a.append(Aw[i]); aug_d.append(Dw[i])
+        aug_t.append(trial_idx[i])
+
+    Xb_list.append(np.stack(aug_x))
+    Fb_list.append(np.stack(aug_f))
+    Vb_list.append(np.array(aug_v))
+    Ab_list.append(np.array(aug_a))
+    Db_list.append(np.array(aug_d))
+    Tb_list.append(np.array(aug_t))
+
+Xb = np.concatenate(Xb_list, axis=0)
+Fb = np.concatenate(Fb_list, axis=0)
+Vb = np.concatenate(Vb_list, axis=0)
+Ab = np.concatenate(Ab_list, axis=0)
+Db = np.concatenate(Db_list, axis=0)
+Tb = np.concatenate(Tb_list, axis=0)
+
+joint_b, cnt_b = np.unique((Vb.astype(int) << 2) + (Ab.astype(int) << 1) + Db.astype(int),
+                           return_counts=True)
+print("Joint AFTER:", dict(zip(joint_b, cnt_b)))
+
+# Shuffle
+perm = np.random.permutation(len(Vb))
+Xb, Fb, Vb, Ab, Db, Tb = Xb[perm], Fb[perm], Vb[perm], Ab[perm], Db[perm], Tb[perm]
+
+# ============================================================
+#   TRAIN / TEST SPLIT
+# ============================================================
+Xtr, Xte, Ftr, Fte, Vtr, Vte, Atr, Ate, Dtr, Dte, Ttr, Tte = train_test_split(
+    Xb, Fb, Vb, Ab, Db, Tb,
+    test_size=0.2,
+    stratify=(Vb + 2*Ab + 4*Db),
+    random_state=SEED
+)
+
+print("Train windows:", Xtr.shape[0], "Test windows:", Xte.shape[0])
+
+# ============================================================
+#   STANDARDIZE HANDCRAFTED FEATURES
+# ============================================================
+scaler = StandardScaler().fit(Ftr)
+Ftr = scaler.transform(Ftr)
+Fte = scaler.transform(Fte)
+
+# CNN expects (channels, time, 1)
+Xtr_raw = Xtr[..., None]
+Xte_raw = Xte[..., None]
+
+print("Raw CNN input shape:", Xtr_raw.shape)
+
+# ============================================================
+#   TRANSFORMER BLOCK
+# ============================================================
+def transformer_block(x, num_heads, key_dim, ff_dim, dropout=0.1):
+    """
+    x: (batch, time, d_model)
+    """
+    # Multi-head self-attention
+    attn_output = layers.MultiHeadAttention(
+        num_heads=num_heads,
+        key_dim=key_dim
+    )(x, x)
+    attn_output = layers.Dropout(dropout)(attn_output)
+    out1 = layers.LayerNormalization(epsilon=1e-6)(x + attn_output)
+
+    # Feed-forward
+    ffn = layers.Dense(ff_dim, activation='relu')(out1)
+    ffn = layers.Dense(key_dim * num_heads)(ffn)  # project back to d_model
+    ffn = layers.Dropout(dropout)(ffn)
+    out2 = layers.LayerNormalization(epsilon=1e-6)(out1 + ffn)
+    return out2
+
+# ============================================================
+#   MODEL 3: CNN + TRANSFORMER + HANDCRAFTED FUSION
+# ============================================================
+def build_cnn_transformer_model(nc, ns, feat_dim,
+                                d_model=128, num_heads=4, ff_dim=256):
+    # Raw EEG input: (channels, time, 1)
+    inp_raw = layers.Input((nc, ns, 1), name="raw_eeg")
+
+    # CNN over time dimension (spatial-temporal filters)
+    x = layers.Conv2D(32, (1, 5), activation='elu', padding='same')(inp_raw)
+    x = layers.Conv2D(64, (1, 5), activation='elu', padding='same')(x)
+    x = layers.MaxPool2D((1, 2))(x)   # halve time
+
+    x = layers.Conv2D(128, (1, 3), activation='elu', padding='same')(x)
+    x = layers.MaxPool2D((1, 2))(x)   # halve time again
+
+    # Now x: (batch, C, T', F)
+    # Rearrange to (batch, T', features) for Transformer
+    x = layers.Permute((2, 1, 3))(x)          # (batch, T', C, F)
+    T_prime = x.shape[1]
+    CF      = x.shape[2] * x.shape[3]
+    x = layers.Reshape((T_prime, CF))(x)      # (batch, T', CF)
+
+    # Project to d_model
+    x = layers.Dense(d_model, activation='elu')(x)
+
+    # One or two Transformer blocks
+    x = transformer_block(x, num_heads=num_heads,
+                          key_dim=d_model // num_heads,
+                          ff_dim=ff_dim, dropout=0.1)
+    x = transformer_block(x, num_heads=num_heads,
+                          key_dim=d_model // num_heads,
+                          ff_dim=ff_dim, dropout=0.1)
+
+    # Global pooling over time
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(128, activation='elu')(x)
+    x = layers.Dropout(0.4)(x)
+
+    # Handcrafted features branch
+    inp_feat = layers.Input((feat_dim,), name="handcrafted")
+    f = layers.Dense(256, activation='elu')(inp_feat)
+    f = layers.Dropout(0.4)(f)
+    f = layers.Dense(128, activation='elu')(f)
+
+    # Fusion
+    h = layers.Concatenate()([x, f])
+    h = layers.Dense(128, activation='elu')(h)
+    h = layers.Dropout(0.4)(h)
+
+    out_v = layers.Dense(1, activation='sigmoid', name='valence')(h)
+    out_a = layers.Dense(1, activation='sigmoid', name='arousal')(h)
+    out_d = layers.Dense(1, activation='sigmoid', name='dominance')(h)
+
+    model = models.Model([inp_raw, inp_feat], [out_v, out_a, out_d])
+
+    model.compile(
+        optimizer=optimizers.Adam(1e-4),
+        loss={
+            'valence': 'binary_crossentropy',
+            'arousal': 'binary_crossentropy',
+            'dominance': 'binary_crossentropy',
+        },
+        metrics={
+            'valence': 'accuracy',
+            'arousal': 'accuracy',
+            'dominance': 'accuracy',
+        }
+    )
+    return model
+
+model = build_cnn_transformer_model(
+    nc=Xtr_raw.shape[1],
+    ns=Xtr_raw.shape[2],
+    feat_dim=Ftr.shape[1]
+)
+
+model.summary()
+
+# ============================================================
+#   TRAINING
+# ============================================================
+es = callbacks.EarlyStopping(
+    monitor="val_loss",
+    patience=4,
+    restore_best_weights=True,
+    verbose=1
+)
+rlr = callbacks.ReduceLROnPlateau(
+    monitor="val_loss",
+    factor=0.5,
+    patience=2,
+    min_lr=1e-6,
+    verbose=1
+)
+
+history = model.fit(
+    [Xtr_raw, Ftr],
+    [Vtr, Atr, Dtr],
+    validation_data=([Xte_raw, Fte], [Vte, Ate, Dte]),
+    epochs=EPOCHS,
+    batch_size=BATCH,
+    callbacks=[es, rlr],
+    verbose=2
+)
+
+# ============================================================
+#   WINDOW-LEVEL EVALUATION
+# ============================================================
+preds = model.predict([Xte_raw, Fte], batch_size=64, verbose=1)
+pv, pa, pd = preds
+
+Pv = (pv.ravel() >= 0.5).astype(int)
+Pa = (pa.ravel() >= 0.5).astype(int)
+Pd = (pd.ravel() >= 0.5).astype(int)
+
+print("\n=== WINDOW-LEVEL (MODEL 3) ===")
+print("Valence  acc:", round(accuracy_score(Vte, Pv)*100, 2), "%")
+print("Arousal  acc:", round(accuracy_score(Ate, Pa)*100, 2), "%")
+print("Dominance acc:", round(accuracy_score(Dte, Pd)*100, 2), "%")
+
+# ============================================================
+#   TRIAL-LEVEL EVALUATION (PROBABILITY AVERAGING)
+# ============================================================
+from collections import defaultdict
+
+def trial_prob_eval(probs, labels, trial_ids):
+    trial_p = defaultdict(list)
+    trial_y = {}
+    for p, y, t in zip(probs, labels, trial_ids):
+        trial_p[t].append(p)
+        if t not in trial_y:
+            trial_y[t] = int(y)
+    y_true, y_pred = [], []
+    for t in sorted(trial_p.keys()):
+        p_mean = np.mean(trial_p[t])
+        pred = 1 if p_mean >= 0.5 else 0
+        y_pred.append(pred)
+        y_true.append(trial_y[t])
+    return np.array(y_true), np.array(y_pred)
+
+y_true_v, y_pred_v = trial_prob_eval(pv.ravel(), Vte, Tte)
+y_true_a, y_pred_a = trial_prob_eval(pa.ravel(), Ate, Tte)
+y_true_d, y_pred_d = trial_prob_eval(pd.ravel(), Dte, Tte)
+
+print("\n=== TRIAL-LEVEL (MODEL 3) ===")
+print("Valence  acc:", round(accuracy_score(y_true_v, y_pred_v)*100, 2), "%")
+print("Arousal  acc:", round(accuracy_score(y_true_a, y_pred_a)*100, 2), "%")
+print("Dominance acc:", round(accuracy_score(y_true_d, y_pred_d)*100, 2), "%")
+
+
+
